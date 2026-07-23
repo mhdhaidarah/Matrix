@@ -122,6 +122,101 @@ curl -fsSL https://raw.githubusercontent.com/mhdhaidarah/Matrix/main/install-mat
 
 If any self-test fails the script exits non-zero and tells you which one.
 
+## Connecting clients
+
+### The homeserver URL
+
+Every client asks for a **homeserver URL**. It is:
+
+```
+https://<server-ip>
+```
+
+**Not** `https://<server-ip>:8443`. Port 8443 only hosts the *web copy* of Element — it's a static
+site, not a homeserver. This is a nasty trap: `https://<server-ip>:8443/_matrix/client/versions`
+returns **HTTP 200 with Element's HTML** (the single-page-app catch-all), so a client sees a 200,
+finds no valid Matrix API, and reports *"Homeserver URL does not appear to be a valid Matrix
+homeserver"*. If you see that error, check the port first.
+
+### Browser
+
+Just open `https://<server-ip>:8443/` and accept the certificate warning. Visit
+`https://<server-ip>/` once and accept it there too, or the client can't reach the homeserver.
+
+### Element Desktop
+
+Element Desktop is Electron. Unlike a browser it offers **no "proceed anyway" button** for an
+untrusted certificate — it just reports the server as invalid.
+
+**Quit Element completely first.** It is a single-instance app that hides in the system tray, so
+launching it again with a flag simply re-focuses the running copy and the flag is ignored. Quit
+from the tray icon, and check for a leftover process (Task Manager / `pkill element`).
+
+Then, for testing:
+
+```bash
+# Linux
+element-desktop --ignore-certificate-errors
+
+# macOS
+/Applications/Element.app/Contents/MacOS/Element --ignore-certificate-errors
+```
+
+```powershell
+# Windows (PowerShell)
+& "$env:LOCALAPPDATA\element-desktop\Element.exe" --ignore-certificate-errors
+```
+
+Better, and permanent — trust the certificate instead. Export it from the server:
+
+```bash
+openssl s_client -connect <server-ip>:443 </dev/null 2>/dev/null \
+  | openssl x509 -outform PEM > matrix.crt
+```
+
+The installer marks the certificate `basicConstraints CA:TRUE`, which Chromium/Electron requires
+before it will accept an imported root, so this works:
+
+```powershell
+# Windows, as Administrator
+Import-Certificate -FilePath matrix.crt -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+```bash
+# Linux
+sudo cp matrix.crt /usr/local/share/ca-certificates/matrix.crt && sudo update-ca-certificates
+```
+
+macOS: open **Keychain Access** → System → drag in `matrix.crt` → set it to **Always Trust**.
+
+### Mobile
+
+**Android.** Element Android shows its own "unrecognised certificate" dialog with a SHA-256
+fingerprint and a **TRUST** button — accept it there. Do *not* bother installing the certificate
+into Android's system credential store: Element Android
+[does not read the user certificate store](https://github.com/vector-im/element-android/issues/4253).
+Compare the fingerprint it shows against the server's:
+
+```bash
+openssl s_client -connect <server-ip>:443 </dev/null 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256
+```
+
+Be aware of a long-standing bug where trusting the certificate can
+[loop forever](https://github.com/element-hq/element-android/issues/7259), and that changing the
+server's certificate later can strand clients on
+["unknown fingerprint"](https://github.com/element-hq/element-android/issues/3867) until you log
+out with "clear data" and back in.
+
+**iOS.** Install the certificate as a configuration profile (mail it to yourself or serve it over
+HTTP), then **Settings → General → About → Certificate Trust Settings** and enable full trust for
+it. The second step is easy to miss and nothing works without it.
+
+**For mobile, a real certificate is genuinely the path of least pain.** Self-signed certificates
+on phones are fragile in a way they aren't on desktop. Install with a real `SERVER_NAME` and run
+`certbot --nginx -d matrix.example.com`. Remember `SERVER_NAME` is baked into every user ID and
+cannot be changed later without wiping the database, so decide before you install.
+
 ## After installing
 
 Credentials are printed at the end and also saved to `/root/matrix-credentials.txt` (mode `600`).

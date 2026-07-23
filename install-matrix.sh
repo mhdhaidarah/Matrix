@@ -674,7 +674,40 @@ ${ELEMENT_NOTE}
   Config:        ${SYN_CONF}
   Add a user:    ${SYN_DIR}/venv/bin/register_new_matrix_user \\
                    -c ${SYN_CONF} http://127.0.0.1:8008
-  Other clients: point them at homeserver https://${SERVER_NAME}
+
+  ---- CONNECTING OTHER CLIENTS (Element Desktop / Android / iOS) ----
+  Homeserver URL to enter:  https://${SERVER_NAME}
+  NOT https://${SERVER_NAME}:${ELEMENT_PORT} - that is only the web copy of
+  Element. Pointing a client at it gives "Homeserver URL does not appear to
+  be a valid Matrix homeserver".
+
+  This server uses a SELF-SIGNED certificate. Desktop and mobile apps are
+  stricter than browsers about that:
+
+  * Element Desktop - quit it COMPLETELY first (it hides in the tray and is
+    single-instance, so a relaunch with flags is otherwise ignored), then:
+        Linux    element-desktop --ignore-certificate-errors
+        macOS    /Applications/Element.app/Contents/MacOS/Element --ignore-certificate-errors
+        Windows  & "\$env:LOCALAPPDATA\\element-desktop\\Element.exe" --ignore-certificate-errors
+    Permanent fix - trust the certificate (it is marked CA:TRUE for this):
+        openssl s_client -connect ${SERVER_IP}:443 </dev/null 2>/dev/null \\
+          | openssl x509 -outform PEM > matrix.crt
+        Windows  Import-Certificate -FilePath matrix.crt -CertStoreLocation Cert:\\LocalMachine\\Root
+        Linux    sudo cp matrix.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates
+        macOS    Keychain Access > System > drag it in > Always Trust
+
+  * Element Android - accept its own "unrecognised certificate" dialog.
+    Installing the cert into Android's store does NOT help; Element Android
+    ignores the user certificate store. Verify the fingerprint matches:
+        openssl s_client -connect ${SERVER_IP}:443 </dev/null 2>/dev/null \\
+          | openssl x509 -noout -fingerprint -sha256
+
+  * Element iOS - install the cert as a profile, THEN enable it under
+    Settings > General > About > Certificate Trust Settings.
+
+  For phones, a real certificate is far less painful: reinstall with a real
+  SERVER_NAME and run  certbot --nginx -d your.domain
+  (SERVER_NAME is baked into every user ID and cannot be changed later.)
 
 ======================================================================
   SAVE THESE CREDENTIALS NOW - the passwords were randomly generated
