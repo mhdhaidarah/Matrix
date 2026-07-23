@@ -30,6 +30,8 @@
 #   SYNAPSE_VERSION=1.157.1          Pin a Synapse version (default: latest)
 #   ELEMENT_PORT=8443                Port for Element Web  (default: 8443)
 #   SKIP_ELEMENT=yes                 Don't install Element Web (default: no)
+#   FEDERATION_PORT=443              Port advertised to other homeservers in
+#                                    .well-known/matrix/server (default: 443)
 #
 # Run it as root:  sudo bash install-matrix.sh
 #==============================================================================
@@ -72,6 +74,13 @@ SYN_DATA="${SYN_DIR}/data"
 ADMIN_DIR="/opt/synapse-admin"
 ELEMENT_DIR="/opt/element"
 ELEMENT_PORT="${ELEMENT_PORT:-8443}"
+# Port advertised to other homeservers via .well-known/matrix/server. The spec
+# parses m.server as <delegated_hostname>[:<delegated_port>] and puts no
+# restriction on the port; 8448 is only the fallback default when nothing is
+# advertised. 443 is used here because nginx already serves /_matrix on it, and
+# it is the one port that also works behind a reverse proxy, CDN or tunnel
+# (Cloudflare et al) where 8448 is not routed.
+FEDERATION_PORT="${FEDERATION_PORT:-443}"
 CRED_FILE="/root/matrix-credentials.txt"
 
 case "${SKIP_ELEMENT:-no}" in
@@ -99,11 +108,23 @@ esac
 #------------------------------------------------------------------------------
 log "Installing system packages (PostgreSQL, nginx, build deps)"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+# A freshly booted VM is usually running unattended-upgrades, which holds the
+# dpkg lock. Without this, piping the installer into bash on a new machine
+# fails within seconds with "Could not get lock /var/lib/dpkg/lock-frontend".
+# DPkg::Lock::Timeout makes apt wait for the lock instead of giving up.
+APT_OPTS=(-o "DPkg::Lock::Timeout=600")
+if ! apt-get "${APT_OPTS[@]}" --version >/dev/null 2>&1; then
+  APT_OPTS=()   # very old apt without the option
+  for _ in $(seq 1 120); do
+    pgrep -x unattended-upgr >/dev/null 2>&1 || break
+    sleep 5
+  done
+fi
+apt-get "${APT_OPTS[@]}" update -qq
 # build-essential/python3-dev/libpq-dev are insurance: Synapse itself ships
 # abi3 wheels, but a brand-new Python (e.g. 3.14 on Ubuntu 26.04) may not have
 # binary wheels for every transitive dependency yet, and pip then builds them.
-apt-get install -y -qq --no-install-recommends \
+apt-get "${APT_OPTS[@]}" install -y -qq --no-install-recommends \
   postgresql postgresql-contrib \
   nginx \
   python3 python3-venv python3-dev \
@@ -319,30 +340,62 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now matrix-synapse
+systemctl enable matrix-synapse
+# restart rather than "enable --now": on a re-run the service is already
+# active, and "--now" would not restart it, leaving Synapse running with the
+# previous config. The config was just rewritten with fresh secrets, so the
+# running process must be replaced or register_new_matrix_user fails with
+# "HMAC incorrect" (it signs with the new shared secret, Synapse checks the old).
+systemctl restart matrix-synapse
+
+wait_for_synapse() {
+  for i in $(seq 1 60); do
+    if curl -fsS --max-time 2 http://127.0.0.1:8008/health >/dev/null 2>&1; then
+      echo "Synapse is up (after ${i}s)"; return 0
+    fi
+    if [[ $i -eq 60 ]]; then
+      journalctl -u matrix-synapse -n 60 --no-pager || true
+      die "Synapse did not start within 60s - see the log above"
+    fi
+    sleep 1
+  done
+}
 
 log "Waiting for Synapse to become healthy"
-for i in $(seq 1 60); do
-  if curl -fsS --max-time 2 http://127.0.0.1:8008/health >/dev/null 2>&1; then
-    echo "Synapse is up (after ${i}s)"; break
-  fi
-  if [[ $i -eq 60 ]]; then
-    journalctl -u matrix-synapse -n 60 --no-pager || true
-    die "Synapse did not start within 60s - see the log above"
-  fi
-  sleep 1
-done
+wait_for_synapse
 
 #------------------------------------------------------------------------------
 # 6. Admin account
 #------------------------------------------------------------------------------
 log "Creating the admin account '@${ADMIN_USER}:${SERVER_NAME}'"
-"${SYN_DIR}/venv/bin/register_new_matrix_user" \
-  -u "${ADMIN_USER}" \
-  -p "${ADMIN_PASSWORD}" \
-  -a \
-  -c "${SYN_CONF}" \
-  http://127.0.0.1:8008 || warn "Admin user may already exist - keeping the existing one"
+if ! "${SYN_DIR}/venv/bin/register_new_matrix_user" \
+       -u "${ADMIN_USER}" \
+       -p "${ADMIN_PASSWORD}" \
+       -a \
+       -c "${SYN_CONF}" \
+       http://127.0.0.1:8008; then
+  # Re-running over an existing install: registration fails because the account
+  # is already there, which means the password generated above was never
+  # applied. Reset it - otherwise this script would finish by printing
+  # credentials that do not work.
+  warn "Admin account already exists - resetting its password to the one printed below"
+  ADMIN_HASH="$("${SYN_DIR}/venv/bin/hash_password" -c "${SYN_CONF}" -p "${ADMIN_PASSWORD}" 2>/dev/null | tail -1)"
+  if [[ "${ADMIN_HASH}" == \$* ]]; then
+    if sudo -u postgres psql -d synapse -v ON_ERROR_STOP=1 -c \
+         "UPDATE users SET password_hash='${ADMIN_HASH}', admin=1 WHERE name='@${ADMIN_USER}:${SERVER_NAME}'" \
+         >/dev/null; then
+      # Synapse caches user records in memory and normally invalidates that
+      # cache itself when it changes a password. A direct SQL write bypasses
+      # that, so restart to make sure the new hash is actually the one used.
+      systemctl restart matrix-synapse
+      wait_for_synapse
+    else
+      warn "Could not reset the admin password - the previous one still applies"
+    fi
+  else
+    warn "Could not hash the new password - the previous admin password still applies"
+  fi
+fi
 
 #------------------------------------------------------------------------------
 # 7. Synapse-Admin web UI
@@ -492,7 +545,7 @@ server {
     location = /.well-known/matrix/server {
         default_type application/json;
         add_header Access-Control-Allow-Origin *;
-        return 200 '{"m.server": "${SERVER_NAME}:8448"}';
+        return 200 '{"m.server": "${SERVER_NAME}:${FEDERATION_PORT}"}';
     }
     location = /.well-known/matrix/client {
         default_type application/json;
@@ -582,6 +635,16 @@ check "Matrix API via HTTPS"           curl -fsSk --max-time 5 "https://${SERVER
 check "Synapse-Admin UI loads"         curl -fsSk --max-time 5 "https://${SERVER_IP}/"
 check "Synapse-Admin config.json"      curl -fsSk --max-time 5 "https://${SERVER_IP}/config.json"
 check ".well-known client"             curl -fsSk --max-time 5 "https://${SERVER_IP}/.well-known/matrix/client"
+check ".well-known server"             curl -fsSk --max-time 5 "https://${SERVER_IP}/.well-known/matrix/server"
+# Federation entry points other homeservers actually call
+check "federation version"             curl -fsSk --max-time 5 "https://${SERVER_IP}/_matrix/federation/v1/version"
+check "signing key (key/v2/server)"    curl -fsSk --max-time 8 "https://${SERVER_IP}/_matrix/key/v2/server"
+if curl -fsSk --max-time 5 "https://${SERVER_IP}/.well-known/matrix/server" \
+     | grep -q "\"${SERVER_NAME}:${FEDERATION_PORT}\""; then
+  echo "  [ OK ] Federation delegation advertises ${SERVER_NAME}:${FEDERATION_PORT}"
+else
+  echo "  [FAIL] Federation delegation"; FAILED=1
+fi
 if [[ ${INSTALL_ELEMENT} -eq 1 ]]; then
   check "Element Web loads"            curl -fsSk --max-time 8 "https://${SERVER_IP}:${ELEMENT_PORT}/"
   check "Element config.json"          curl -fsSk --max-time 8 "https://${SERVER_IP}:${ELEMENT_PORT}/config.json"
@@ -661,6 +724,15 @@ ${ELEMENT_NOTE}
   registration_shared_secret: ${REGISTRATION_SHARED_SECRET}
   macaroon_secret_key:        ${MACAROON_SECRET_KEY}
   form_secret:                ${FORM_SECRET}
+
+  ---- FEDERATION ----
+  Advertised to other homeservers as: ${SERVER_NAME}:${FEDERATION_PORT}
+  (via https://${SERVER_NAME}/.well-known/matrix/server)
+  Port 8448 also listens directly, for setups that prefer it.
+  Verify from the outside with:
+    https://federationtester.matrix.org/#${SERVER_NAME}
+  Federation needs a PUBLICLY TRUSTED certificate and a real domain - it
+  will not work with the self-signed cert or an IP-based server_name.
 
   ---- VERSIONS ----
   Synapse:            ${SYNAPSE_VER}

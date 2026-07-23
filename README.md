@@ -105,6 +105,7 @@ curl -fsSL https://raw.githubusercontent.com/mhdhaidarah/Matrix/main/install-mat
 | `SYNAPSE_VERSION` | latest | Pin a specific Synapse release |
 | `ELEMENT_PORT` | `8443` | Port Element Web listens on |
 | `SKIP_ELEMENT` | `no` | Set to `yes` to not install the chat client |
+| `FEDERATION_PORT` | `443` | Port advertised in `.well-known/matrix/server` |
 
 ## What the installer does
 
@@ -217,6 +218,52 @@ on phones are fragile in a way they aren't on desktop. Install with a real `SERV
 `certbot --nginx -d matrix.example.com`. Remember `SERVER_NAME` is baked into every user ID and
 cannot be changed later without wiping the database, so decide before you install.
 
+## Federation
+
+Federation — letting users on matrix.org and other homeservers talk to yours — needs two things
+the defaults deliberately don't give you:
+
+1. A **real domain** as `SERVER_NAME`, set at install time. An IP-based `server_name` can never
+   federate, and it cannot be changed afterwards without wiping the database.
+2. A **publicly trusted certificate**. The self-signed one will not do.
+
+### Delegation on port 443
+
+`.well-known/matrix/server` advertises `<server-name>:443`, not `:8448`. This is spec-compliant —
+the [Server-Server API](https://spec.matrix.org/latest/server-server-api/) parses `m.server` as
+`<delegated_hostname>[:<delegated_port>]` and puts no restriction on the port. `8448` is only the
+fallback used when nothing is advertised.
+
+443 is the default here because nginx already serves `/_matrix` on it, and it is the one port that
+also works behind a reverse proxy, CDN or tunnel — Cloudflare Tunnel, for instance, routes 443 but
+not 8448, so `:8448` delegation would leave you unreachable. Port 8448 still listens directly for
+setups that prefer it; use `FEDERATION_PORT=8448` to advertise it instead.
+
+The trade-off: on 443 federation traffic shares a port with client traffic and so passes through
+your CDN's WAF/bot protection. If federation fails intermittently behind Cloudflare, add a rule to
+skip security checks for `/_matrix/*`.
+
+### Checking it works
+
+```
+https://federationtester.matrix.org/#your.domain
+```
+
+You want `"FederationOK": true`. Then confirm real traffic flows, using an access token from your
+server:
+
+```bash
+# outbound federation - fetch a profile from matrix.org
+curl -H "Authorization: Bearer $TOKEN" \
+  https://your.domain/_matrix/client/v3/profile/@matthew:matrix.org
+```
+
+### Behind Cloudflare Tunnel
+
+Route `https://your.domain` to `localhost:443` and install with the domain as `SERVER_NAME`.
+Cloudflare supplies the public certificate, so clients — including Element Desktop and mobile —
+stop complaining about self-signed certs entirely.
+
 ## After installing
 
 Credentials are printed at the end and also saved to `/root/matrix-credentials.txt` (mode `600`).
@@ -242,6 +289,26 @@ The defaults are built for a private/LAN server. For a public homeserver you sho
   `certbot --nginx -d matrix.example.com` — federation with other homeservers requires a
   publicly trusted certificate
 - Open ports `443` and `8448`
+
+## Re-running the installer
+
+Running the script again over an existing install is safe and is how you pick up a new Synapse,
+Synapse-Admin or Element release. It keeps your database, rooms and users.
+
+Two things it deliberately does *not* keep:
+
+- **Secrets are regenerated.** `registration_shared_secret`, `macaroon_secret_key` and `form_secret`
+  are rewritten, and the admin account's password is **reset** to the newly printed one. The
+  credentials printed at the end are always the ones that work — that is the point.
+- **Synapse is restarted**, not merely started, so the rewritten config actually takes effect.
+
+If you want to keep the current admin password across a re-run, pass it explicitly:
+
+```bash
+ADMIN_PASSWORD='your-existing-password' sudo -E bash install-matrix.sh
+```
+
+To wipe everything and start clean instead, run `uninstall-matrix.sh` first.
 
 ## Uninstall
 
