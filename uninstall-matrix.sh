@@ -3,9 +3,10 @@
 # Usage: sudo bash uninstall-matrix.sh
 set -uo pipefail
 systemctl disable --now matrix-synapse 2>/dev/null
-rm -rf /opt/synapse /opt/synapse-admin
+rm -rf /opt/synapse /opt/synapse-admin /opt/element
 rm -f /etc/systemd/system/matrix-synapse.service
 rm -f /etc/nginx/sites-enabled/matrix /etc/nginx/sites-available/matrix
+rm -f /etc/nginx/sites-enabled/element /etc/nginx/sites-available/element
 rm -f /root/matrix-credentials.txt
 rm -f /etc/ssl/certs/matrix.crt /etc/ssl/private/matrix.key
 systemctl daemon-reload

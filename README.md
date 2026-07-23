@@ -2,8 +2,8 @@
 
 Installs a **complete, working Matrix homeserver** on a fresh Ubuntu/Debian box with a single
 command: [Synapse](https://github.com/element-hq/synapse) on PostgreSQL, behind nginx with TLS,
-plus the [Synapse-Admin](https://github.com/Awesome-Technologies/synapse-admin) web UI already
-wired to it.
+plus the [Synapse-Admin](https://github.com/Awesome-Technologies/synapse-admin) web UI and the
+[Element Web](https://github.com/element-hq/element-web) chat client — all wired together.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mhdhaidarah/Matrix/main/install-matrix.sh | sudo bash
@@ -18,15 +18,44 @@ randomised fresh for each install.
 
 | Piece | Where |
 |---|---|
+| **Element Web** (chat client) | `https://<server-ip>:8443/` |
 | **Synapse-Admin UI** | `https://<server-ip>/` |
 | **Matrix client API** | `https://<server-ip>/_matrix` |
 | **Synapse admin API** | `https://<server-ip>/_synapse/admin` |
 | **Federation** | port `8448` (+ `/.well-known/matrix/server`) |
 | **Admin account** | `@admin:<server-name>`, random password, printed at the end |
 
-Synapse-Admin is served at the **same origin** as the Matrix API, so there is no CORS
-configuration to get wrong and only **one** self-signed certificate for your browser to trust.
-The UI's homeserver field is pre-pinned to this server via `restrictBaseUrl`.
+Both web apps are pinned to this homeserver, so nobody has to type a server URL: Element via
+`default_server_config` + `disable_custom_urls`, Synapse-Admin via `restrictBaseUrl`.
+
+### Why Element is on a separate port
+
+Element Web's [Important Security Notes](https://github.com/element-hq/element-web/blob/develop/apps/web/README.md#important-security-notes)
+are explicit:
+
+> We do not recommend running Element from the same domain name as your Matrix homeserver. The
+> reason is the risk of XSS (cross-site-scripting) vulnerabilities that could occur if someone
+> caused Element to load and render malicious user generated content from a Matrix API which then
+> had trusted access to Element (or other apps) due to sharing the same domain.
+
+A different port is a different web origin, so Element gets its own `localStorage`/DOM sandbox
+rather than sharing one with the homeserver. Change it with `ELEMENT_PORT`, or skip Element
+entirely with `SKIP_ELEMENT=yes`.
+
+Synapse-Admin *is* served on the homeserver's origin (that's what keeps its admin-API calls
+CORS-free). For an internet-facing deployment, put all three on separate hostnames with real
+certificates.
+
+### First run with the self-signed certificate
+
+Element and the homeserver are two different origins, and browsers store certificate exceptions
+per host **and port**. Visit both once and accept the warning on each, otherwise Element will
+report that it cannot reach the homeserver:
+
+1. `https://<server-ip>/` — homeserver + admin UI
+2. `https://<server-ip>:8443/` — Element
+
+This goes away entirely once you use a real certificate.
 
 ## Requirements
 
@@ -74,6 +103,8 @@ curl -fsSL https://raw.githubusercontent.com/mhdhaidarah/Matrix/main/install-mat
 | `ADMIN_PASSWORD` | random | Admin password |
 | `ENABLE_REGISTRATION` | `no` | Allow anyone to sign up |
 | `SYNAPSE_VERSION` | latest | Pin a specific Synapse release |
+| `ELEMENT_PORT` | `8443` | Port Element Web listens on |
+| `SKIP_ELEMENT` | `no` | Set to `yes` to not install the chat client |
 
 ## What the installer does
 
